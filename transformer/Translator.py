@@ -59,17 +59,21 @@ class Translator(object):
         beam_size = self.opt.beam_size
 
         #- Enocde
-        enc_outputs, enc_slf_attns = self.model.encoder(src_seq, src_pos)
+        enc_output, *_ = self.model.encoder(src_seq, src_pos)
 
         #--- Repeat data for beam
-        src_seq = Variable(src_seq.data.repeat(beam_size, 1))
-        enc_outputs = [
-            Variable(enc_output.data.repeat(beam_size, 1, 1))
-            for enc_output in enc_outputs]
+        src_seq = Variable(
+            src_seq.data.repeat(1, beam_size).view(
+                src_seq.size(0) * beam_size, src_seq.size(1)))
+
+        enc_output = Variable(
+            enc_output.data.repeat(1, beam_size, 1).view(
+                enc_output.size(0) * beam_size, enc_output.size(1), enc_output.size(2)))
 
         #--- Prepare beams
-        beam = [Beam(beam_size, self.opt.cuda) for k in range(batch_size)]
-        batch_idx = list(range(batch_size))
+        beams = [Beam(beam_size, self.opt.cuda) for _ in range(batch_size)]
+        beam_inst_idx_map = {
+            beam_idx: inst_idx for inst_idx, beam_idx in enumerate(range(batch_size))}
         n_remaining_sents = batch_size
 
         #- Decode
@@ -77,85 +81,103 @@ class Translator(object):
 
             len_dec_seq = i + 1
 
-            # -- Preparing decode data seq -- #
-            input_data = torch.stack([
-                b.get_current_state() for b in beam if not b.done]) # size: mb x bm x sq
-            input_data = input_data.view(-1, len_dec_seq)           # size: (mb*bm) x sq
-            input_data = Variable(input_data, volatile=True)
-
-            # -- Preparing decode pos seq -- #
-            # size: 1 x seq
-            input_pos = torch.arange(1, len_dec_seq + 1).unsqueeze(0)
+            # -- Preparing decoded data seq -- #
+            # size: batch x beam x seq
+            dec_partial_seq = torch.stack([
+                b.get_current_state() for b in beams if not b.done])
             # size: (batch * beam) x seq
-            input_pos = input_pos.repeat(n_remaining_sents * beam_size, 1)
-            input_pos = Variable(input_pos.type(torch.LongTensor), volatile=True)
+            dec_partial_seq = dec_partial_seq.view(-1, len_dec_seq)
+            # wrap into a Variable
+            dec_partial_seq = Variable(dec_partial_seq, volatile=True)
+
+            # -- Preparing decoded pos seq -- #
+            # size: 1 x seq
+            dec_partial_pos = torch.arange(1, len_dec_seq + 1).unsqueeze(0)
+            # size: (batch * beam) x seq
+            dec_partial_pos = dec_partial_pos.repeat(n_remaining_sents * beam_size, 1)
+            # wrap into a Variable
+            dec_partial_pos = Variable(dec_partial_pos.type(torch.LongTensor), volatile=True)
 
             if self.opt.cuda:
-                input_pos = input_pos.cuda()
-                input_data = input_data.cuda()
+                dec_partial_seq = dec_partial_seq.cuda()
+                dec_partial_pos = dec_partial_pos.cuda()
 
             # -- Decoding -- #
-            dec_outputs, dec_slf_attns, dec_enc_attns = self.model.decoder(
-                input_data, input_pos, src_seq, enc_outputs)
-            dec_output = dec_outputs[-1][:, -1, :] # (batch * beam) * d_model
+            dec_output, *_ = self.model.decoder(
+                dec_partial_seq, dec_partial_pos, src_seq, enc_output)
+            dec_output = dec_output[:, -1, :] # (batch * beam) * d_model
             dec_output = self.model.tgt_word_proj(dec_output)
             out = self.model.prob_projection(dec_output)
 
             # batch x beam x n_words
             word_lk = out.view(n_remaining_sents, beam_size, -1).contiguous()
 
-            active = []
-            for b in range(batch_size):
-                if beam[b].done:
+            active_beam_idx_list = []
+            for beam_idx in range(batch_size):
+                if beams[beam_idx].done:
                     continue
 
-                idx = batch_idx[b]
-                if not beam[b].advance(word_lk.data[idx]):
-                    active += [b]
+                inst_idx = beam_inst_idx_map[beam_idx]
+                if not beams[beam_idx].advance(word_lk.data[inst_idx]):
+                    active_beam_idx_list += [beam_idx]
 
-            if not active:
+            if not active_beam_idx_list:
+                # all instances have finished their path to <EOS>
                 break
 
             # in this section, the sentences that are still active are
             # compacted so that the decoder is not run on completed sentences
-            active_idx = self.tt.LongTensor([batch_idx[k] for k in active])
-            batch_idx = {beam: idx for idx, beam in enumerate(active)}
+            active_inst_idxs = self.tt.LongTensor(
+                [beam_inst_idx_map[k] for k in active_beam_idx_list])
 
-            def update_active_enc_info(tensor_var, active_idx):
-                ''' Remove the encoder outputs of finished instances in one batch. '''
-                tensor_data = tensor_var.data.view(n_remaining_sents, -1, self.model_opt.d_model)
+            # update the idx mapping
+            beam_inst_idx_map = {
+                beam_idx: inst_idx for inst_idx, beam_idx in enumerate(active_beam_idx_list)}
 
-                new_size = list(tensor_var.size())
-                new_size[0] = new_size[0] * len(active_idx) // n_remaining_sents
-
-                # select the active index in batch
-                return Variable(
-                    tensor_data.index_select(0, active_idx).view(*new_size),
-                    volatile=True)
-
-            def update_active_seq(seq, active_idx):
+            def update_active_seq(seq_var, active_inst_idxs):
                 ''' Remove the src sequence of finished instances in one batch. '''
-                view = seq.data.view(n_remaining_sents, -1)
-                new_size = list(seq.size())
-                new_size[0] = new_size[0] * len(active_idx) // n_remaining_sents # trim on batch dim
 
-                # select the active index in batch
-                return Variable(view.index_select(0, active_idx).view(*new_size), volatile=True)
+                inst_idx_dim_size, *rest_dim_sizes = seq_var.size()
+                inst_idx_dim_size = inst_idx_dim_size * len(active_inst_idxs) // n_remaining_sents
+                new_size = (inst_idx_dim_size, *rest_dim_sizes)
 
-            src_seq = update_active_seq(src_seq, active_idx)
-            enc_outputs = [
-                update_active_enc_info(enc_output, active_idx)
-                for enc_output in enc_outputs]
-            n_remaining_sents = len(active)
+                # select the active instances in batch
+                original_seq_data = seq_var.data.view(n_remaining_sents, -1)
+                active_seq_data = original_seq_data.index_select(0, active_inst_idxs)
+                active_seq_data = active_seq_data.view(*new_size)
+
+                return Variable(active_seq_data, volatile=True)
+
+            def update_active_enc_info(enc_info_var, active_inst_idxs):
+                ''' Remove the encoder outputs of finished instances in one batch. '''
+
+                inst_idx_dim_size, *rest_dim_sizes = enc_info_var.size()
+                inst_idx_dim_size = inst_idx_dim_size * len(active_inst_idxs) // n_remaining_sents
+                new_size = (inst_idx_dim_size, *rest_dim_sizes)
+
+                # select the active instances in batch
+                original_enc_info_data = enc_info_var.data.view(
+                    n_remaining_sents, -1, self.model_opt.d_model)
+                active_enc_info_data = original_enc_info_data.index_select(0, active_inst_idxs)
+                active_enc_info_data = active_enc_info_data.view(*new_size)
+
+                return Variable(active_enc_info_data, volatile=True)
+
+            src_seq = update_active_seq(src_seq, active_inst_idxs)
+            enc_output = update_active_enc_info(enc_output, active_inst_idxs)
+
+            #- update the remaining size
+            n_remaining_sents = len(active_inst_idxs)
 
         #- Return useful information
         all_hyp, all_scores = [], []
         n_best = self.opt.n_best
 
-        for b in range(batch_size):
-            scores, ks = beam[b].sort_scores()
+        for beam_idx in range(batch_size):
+            scores, tail_idxs = beams[beam_idx].sort_scores()
             all_scores += [scores[:n_best]]
-            hyps = [beam[b].get_hypothesis(k) for k in ks[:n_best]]
+
+            hyps = [beams[beam_idx].get_hypothesis(i) for i in tail_idxs[:n_best]]
             all_hyp += [hyps]
 
         return all_hyp, all_scores

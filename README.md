@@ -53,7 +53,7 @@ An example of training for the WMT'16 Multimodal Translation task (http://www.st
 mkdir -p data/multi30k
 wget http://www.quest.dcs.shef.ac.uk/wmt16_files_mmt/training.tar.gz &&  tar -xf training.tar.gz -C data/multi30k && rm training.tar.gz
 wget http://www.quest.dcs.shef.ac.uk/wmt16_files_mmt/validation.tar.gz && tar -xf validation.tar.gz -C data/multi30k && rm validation.tar.gz
-wget https://staff.fnwi.uva.nl/d.elliott/wmt16/mmt16_task1_test.tgz && tar -xf mmt16_task1_test.tgz -C data/multi30k && rm mmt16_task1_test.tgz
+wget http://www.quest.dcs.shef.ac.uk/wmt16_files_mmt/mmt16_task1_test.tar.gz && tar -xf mmt16_task1_test.tar.gz -C data/multi30k && rm mmt16_task1_test.tar.gz
 ```
 
 ### 1) Preprocess the data.
@@ -78,16 +78,28 @@ python translate.py -model trained.chkpt -vocab data/multi30k.atok.low.pt -src d
 ## Training
 
 <p align="center">
-<img src="http://imgur.com/i9Fs8Gh.png" width="400">
-<img src="http://imgur.com/GC2VsTA.png" width="400">
+<img src="https://imgur.com/A6byNQ8.png" width="400">
+<img src="https://imgur.com/5z4f4tw.png" width="400">
 </p>
 
-> Parameter settings:
->> batch_size=64, d_inner_hid=1024, d_k=64, d_v=64, d_model=512, d_word_vec=512, dropout=0.1, embs_share_weight=False, n_head=8, n_layers=6, n_warmup_steps=4000, proj_share_weight=True
+- Parameter settings:
+  - batch_size=64
+  - d_inner_hid=1024
+  - d_k=64
+  - d_v=64
+  - d_model=512
+  - d_word_vec=512
+  - dropout=0.1
+  - embs_share_weight=False
+  - n_head=8
+  - n_layers=6
+  - n_warmup_steps=4000
+  - proj_share_weight=True
 
-> Elapse (per epoch):
->> Training set: 2.4 min, Validation set: 0.03 min (on NVIDIA Titan X)
-
+- Elapse per epoch  (on NVIDIA Titan X):
+  - Training set: 1.38 min
+  - Validation set: 0.016 min
+  
 ## Testing 
 - coming soon.
 ---
@@ -98,4 +110,4 @@ python translate.py -model trained.chkpt -vocab data/multi30k.atok.low.pt -src d
 ---
 # Acknowledgement
 - The project structure, some scripts and the dataset preprocessing steps are heavily borrowed from [OpenNMT/OpenNMT-py](https://github.com/OpenNMT/OpenNMT-py).
-- Thanks for the suggestions from @srush and @iamalbert.
+- Thanks for the suggestions from @srush, @iamalbert and @ZiJianZhao.
