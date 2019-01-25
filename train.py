@@ -8,100 +8,125 @@ import time
 
 from tqdm import tqdm
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+import torch.utils.data
 import transformer.Constants as Constants
+from dataset import TranslationDataset, paired_collate_fn
 from transformer.Models import Transformer
 from transformer.Optim import ScheduledOptim
-from DataLoader import DataLoader
 
-def get_performance(crit, pred, gold, smoothing=False, num_class=None):
+def cal_performance(pred, gold, smoothing=False):
     ''' Apply label smoothing if needed '''
 
-    # TODO: Add smoothing
-    if smoothing:
-        assert bool(num_class)
-        eps = 0.1
-        gold = gold * (1 - eps) + (1 - gold) * eps / num_class
-        raise NotImplementedError
-
-    loss = crit(pred, gold.contiguous().view(-1))
+    loss = cal_loss(pred, gold, smoothing)
 
     pred = pred.max(1)[1]
-
     gold = gold.contiguous().view(-1)
-    n_correct = pred.data.eq(gold.data)
-    n_correct = n_correct.masked_select(gold.ne(Constants.PAD).data).sum()
+    non_pad_mask = gold.ne(Constants.PAD)
+    n_correct = pred.eq(gold)
+    n_correct = n_correct.masked_select(non_pad_mask).sum().item()
 
     return loss, n_correct
 
-def train_epoch(model, training_data, crit, optimizer):
+
+def cal_loss(pred, gold, smoothing):
+    ''' Calculate cross entropy loss, apply label smoothing if needed. '''
+
+    gold = gold.contiguous().view(-1)
+
+    if smoothing:
+        eps = 0.1
+        n_class = pred.size(1)
+
+        one_hot = torch.zeros_like(pred).scatter(1, gold.view(-1, 1), 1)
+        one_hot = one_hot * (1 - eps) + (1 - one_hot) * eps / (n_class - 1)
+        log_prb = F.log_softmax(pred, dim=1)
+
+        non_pad_mask = gold.ne(Constants.PAD)
+        loss = -(one_hot * log_prb).sum(dim=1)
+        loss = loss.masked_select(non_pad_mask).sum()  # average later
+    else:
+        loss = F.cross_entropy(pred, gold, ignore_index=Constants.PAD, reduction='sum')
+
+    return loss
+
+
+def train_epoch(model, training_data, optimizer, device, smoothing):
     ''' Epoch operation in training phase'''
 
     model.train()
 
     total_loss = 0
-    n_total_words = 0
-    n_total_correct = 0
+    n_word_total = 0
+    n_word_correct = 0
 
     for batch in tqdm(
             training_data, mininterval=2,
             desc='  - (Training)   ', leave=False):
 
         # prepare data
-        src, tgt = batch
-        gold = tgt[0][:, 1:]
+        src_seq, src_pos, tgt_seq, tgt_pos = map(lambda x: x.to(device), batch)
+        gold = tgt_seq[:, 1:]
 
         # forward
         optimizer.zero_grad()
-        pred = model(src, tgt)
+        pred = model(src_seq, src_pos, tgt_seq, tgt_pos)
 
         # backward
-        loss, n_correct = get_performance(crit, pred, gold)
+        loss, n_correct = cal_performance(pred, gold, smoothing=smoothing)
         loss.backward()
 
         # update parameters
-        optimizer.step()
-        optimizer.update_learning_rate()
+        optimizer.step_and_update_lr()
 
         # note keeping
-        n_words = gold.data.ne(Constants.PAD).sum()
-        n_total_words += n_words
-        n_total_correct += n_correct
-        total_loss += loss.data[0]
+        total_loss += loss.item()
 
-    return total_loss/n_total_words, n_total_correct/n_total_words
+        non_pad_mask = gold.ne(Constants.PAD)
+        n_word = non_pad_mask.sum().item()
+        n_word_total += n_word
+        n_word_correct += n_correct
 
-def eval_epoch(model, validation_data, crit):
+    loss_per_word = total_loss/n_word_total
+    accuracy = n_word_correct/n_word_total
+    return loss_per_word, accuracy
+
+def eval_epoch(model, validation_data, device):
     ''' Epoch operation in evaluation phase '''
 
     model.eval()
 
     total_loss = 0
-    n_total_words = 0
-    n_total_correct = 0
+    n_word_total = 0
+    n_word_correct = 0
 
-    for batch in tqdm(
-            validation_data, mininterval=2,
-            desc='  - (Validation) ', leave=False):
+    with torch.no_grad():
+        for batch in tqdm(
+                validation_data, mininterval=2,
+                desc='  - (Validation) ', leave=False):
 
-        # prepare data
-        src, tgt = batch
-        gold = tgt[0][:, 1:]
+            # prepare data
+            src_seq, src_pos, tgt_seq, tgt_pos = map(lambda x: x.to(device), batch)
+            gold = tgt_seq[:, 1:]
 
-        # forward
-        pred = model(src, tgt)
-        loss, n_correct = get_performance(crit, pred, gold)
+            # forward
+            pred = model(src_seq, src_pos, tgt_seq, tgt_pos)
+            loss, n_correct = cal_performance(pred, gold, smoothing=False)
 
-        # note keeping
-        n_words = gold.data.ne(Constants.PAD).sum()
-        n_total_words += n_words
-        n_total_correct += n_correct
-        total_loss += loss.data[0]
+            # note keeping
+            total_loss += loss.item()
 
-    return total_loss/n_total_words, n_total_correct/n_total_words
+            non_pad_mask = gold.ne(Constants.PAD)
+            n_word = non_pad_mask.sum().item()
+            n_word_total += n_word
+            n_word_correct += n_correct
 
-def train(model, training_data, validation_data, crit, optimizer, opt):
+    loss_per_word = total_loss/n_word_total
+    accuracy = n_word_correct/n_word_total
+    return loss_per_word, accuracy
+
+def train(model, training_data, validation_data, optimizer, device, opt):
     ''' Start training '''
 
     log_train_file = None
@@ -123,14 +148,15 @@ def train(model, training_data, validation_data, crit, optimizer, opt):
         print('[ Epoch', epoch_i, ']')
 
         start = time.time()
-        train_loss, train_accu = train_epoch(model, training_data, crit, optimizer)
+        train_loss, train_accu = train_epoch(
+            model, training_data, optimizer, device, smoothing=opt.label_smoothing)
         print('  - (Training)   ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
               'elapse: {elapse:3.3f} min'.format(
                   ppl=math.exp(min(train_loss, 100)), accu=100*train_accu,
                   elapse=(time.time()-start)/60))
 
         start = time.time()
-        valid_loss, valid_accu = eval_epoch(model, validation_data, crit)
+        valid_loss, valid_accu = eval_epoch(model, validation_data, device)
         print('  - (Validation) ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
                 'elapse: {elapse:3.3f} min'.format(
                     ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu,
@@ -174,7 +200,7 @@ def main():
 
     #parser.add_argument('-d_word_vec', type=int, default=512)
     parser.add_argument('-d_model', type=int, default=512)
-    parser.add_argument('-d_inner_hid', type=int, default=1024)
+    parser.add_argument('-d_inner_hid', type=int, default=2048)
     parser.add_argument('-d_k', type=int, default=64)
     parser.add_argument('-d_v', type=int, default=64)
 
@@ -191,6 +217,7 @@ def main():
     parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
 
     parser.add_argument('-no_cuda', action='store_true')
+    parser.add_argument('-label_smoothing', action='store_true')
 
     opt = parser.parse_args()
     opt.cuda = not opt.no_cuda
@@ -200,72 +227,67 @@ def main():
     data = torch.load(opt.data)
     opt.max_token_seq_len = data['settings'].max_token_seq_len
 
-    #========= Preparing DataLoader =========#
-    training_data = DataLoader(
-        data['dict']['src'],
-        data['dict']['tgt'],
-        src_insts=data['train']['src'],
-        tgt_insts=data['train']['tgt'],
-        batch_size=opt.batch_size,
-        cuda=opt.cuda)
+    training_data, validation_data = prepare_dataloaders(data, opt)
 
-    validation_data = DataLoader(
-        data['dict']['src'],
-        data['dict']['tgt'],
-        src_insts=data['valid']['src'],
-        tgt_insts=data['valid']['tgt'],
-        batch_size=opt.batch_size,
-        shuffle=False,
-        test=True,
-        cuda=opt.cuda)
-
-    opt.src_vocab_size = training_data.src_vocab_size
-    opt.tgt_vocab_size = training_data.tgt_vocab_size
+    opt.src_vocab_size = training_data.dataset.src_vocab_size
+    opt.tgt_vocab_size = training_data.dataset.tgt_vocab_size
 
     #========= Preparing Model =========#
-    if opt.embs_share_weight and training_data.src_word2idx != training_data.tgt_word2idx:
-        print('[Warning]',
-              'The src/tgt word2idx table are different but asked to share word embedding.')
+    if opt.embs_share_weight:
+        assert training_data.dataset.src_word2idx == training_data.dataset.tgt_word2idx, \
+            'The src/tgt word2idx table are different but asked to share word embedding.'
 
     print(opt)
 
+    device = torch.device('cuda' if opt.cuda else 'cpu')
     transformer = Transformer(
         opt.src_vocab_size,
         opt.tgt_vocab_size,
         opt.max_token_seq_len,
-        proj_share_weight=opt.proj_share_weight,
-        embs_share_weight=opt.embs_share_weight,
+        tgt_emb_prj_weight_sharing=opt.proj_share_weight,
+        emb_src_tgt_weight_sharing=opt.embs_share_weight,
         d_k=opt.d_k,
         d_v=opt.d_v,
         d_model=opt.d_model,
         d_word_vec=opt.d_word_vec,
-        d_inner_hid=opt.d_inner_hid,
+        d_inner=opt.d_inner_hid,
         n_layers=opt.n_layers,
         n_head=opt.n_head,
-        dropout=opt.dropout)
-
-    #print(transformer)
+        dropout=opt.dropout).to(device)
 
     optimizer = ScheduledOptim(
         optim.Adam(
-            transformer.get_trainable_parameters(),
+            filter(lambda x: x.requires_grad, transformer.parameters()),
             betas=(0.9, 0.98), eps=1e-09),
         opt.d_model, opt.n_warmup_steps)
 
+    train(transformer, training_data, validation_data, optimizer, device ,opt)
 
-    def get_criterion(vocab_size):
-        ''' With PAD token zero weight '''
-        weight = torch.ones(vocab_size)
-        weight[Constants.PAD] = 0
-        return nn.CrossEntropyLoss(weight, size_average=False)
 
-    crit = get_criterion(training_data.tgt_vocab_size)
+def prepare_dataloaders(data, opt):
+    # ========= Preparing DataLoader =========#
+    train_loader = torch.utils.data.DataLoader(
+        TranslationDataset(
+            src_word2idx=data['dict']['src'],
+            tgt_word2idx=data['dict']['tgt'],
+            src_insts=data['train']['src'],
+            tgt_insts=data['train']['tgt']),
+        num_workers=2,
+        batch_size=opt.batch_size,
+        collate_fn=paired_collate_fn,
+        shuffle=True)
 
-    if opt.cuda:
-        transformer = transformer.cuda()
-        crit = crit.cuda()
+    valid_loader = torch.utils.data.DataLoader(
+        TranslationDataset(
+            src_word2idx=data['dict']['src'],
+            tgt_word2idx=data['dict']['tgt'],
+            src_insts=data['valid']['src'],
+            tgt_insts=data['valid']['tgt']),
+        num_workers=2,
+        batch_size=opt.batch_size,
+        collate_fn=paired_collate_fn)
+    return train_loader, valid_loader
 
-    train(transformer, training_data, validation_data, crit, optimizer, opt)
 
 if __name__ == '__main__':
     main()

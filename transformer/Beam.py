@@ -9,25 +9,23 @@ import torch
 import numpy as np
 import transformer.Constants as Constants
 
-class Beam(object):
-    ''' Store the neccesary info for beam search. '''
+class Beam():
+    ''' Beam search '''
 
-    def __init__(self, size, cuda=False):
+    def __init__(self, size, device=False):
 
         self.size = size
-        self.done = False
-
-        self.tt = torch.cuda if cuda else torch
+        self._done = False
 
         # The score for each translation on the beam.
-        self.scores = self.tt.FloatTensor(size).zero_()
+        self.scores = torch.zeros((size,), dtype=torch.float, device=device)
         self.all_scores = []
 
         # The backpointers at each time-step.
         self.prev_ks = []
 
         # The outputs at each time-step.
-        self.next_ys = [self.tt.LongTensor(size).fill_(Constants.PAD)]
+        self.next_ys = [torch.full((size,), Constants.PAD, dtype=torch.long, device=device)]
         self.next_ys[0][0] = Constants.BOS
 
     def get_current_state(self):
@@ -38,15 +36,19 @@ class Beam(object):
         "Get the backpointers for the current timestep."
         return self.prev_ks[-1]
 
-    def advance(self, word_lk):
-        "Update the status and check for finished or not."
-        num_words = word_lk.size(1)
+    @property
+    def done(self):
+        return self._done
+
+    def advance(self, word_prob):
+        "Update beam status and check if finished or not."
+        num_words = word_prob.size(1)
 
         # Sum the previous scores.
         if len(self.prev_ks) > 0:
-            beam_lk = word_lk + self.scores.unsqueeze(1).expand_as(word_lk)
+            beam_lk = word_prob + self.scores.unsqueeze(1).expand_as(word_prob)
         else:
-            beam_lk = word_lk[0]
+            beam_lk = word_prob[0]
 
         flat_beam_lk = beam_lk.view(-1)
 
@@ -56,18 +58,18 @@ class Beam(object):
         self.all_scores.append(self.scores)
         self.scores = best_scores
 
-        # bestScoresId is flattened beam x word array, so calculate which
-        # word and beam each score came from
+        # bestScoresId is flattened as a (beam x word) array,
+        # so we need to calculate which word and beam each score came from
         prev_k = best_scores_id / num_words
         self.prev_ks.append(prev_k)
         self.next_ys.append(best_scores_id - prev_k * num_words)
 
         # End condition is when top-of-beam is EOS.
-        if self.next_ys[-1][0] == Constants.EOS:
-            self.done = True
+        if self.next_ys[-1][0].item() == Constants.EOS:
+            self._done = True
             self.all_scores.append(self.scores)
 
-        return self.done
+        return self._done
 
     def sort_scores(self):
         "Sort the scores."
@@ -87,26 +89,15 @@ class Beam(object):
             _, keys = self.sort_scores()
             hyps = [self.get_hypothesis(k) for k in keys]
             hyps = [[Constants.BOS] + h for h in hyps]
-            dec_seq = torch.from_numpy(np.array(hyps))
+            dec_seq = torch.LongTensor(hyps)
 
         return dec_seq
 
     def get_hypothesis(self, k):
-        """
-        Walk back to construct the full hypothesis.
-
-        Parameters.
-
-             * `k` - the position in the beam to construct.
-
-         Returns.
-
-            1. The hypothesis
-            2. The attention at each time step.
-        """
+        """ Walk back to construct the full hypothesis. """
         hyp = []
         for j in range(len(self.prev_ks) - 1, -1, -1):
             hyp.append(self.next_ys[j+1][k])
             k = self.prev_ks[j][k]
 
-        return hyp[::-1]
+        return list(map(lambda x: x.item(), hyp[::-1]))

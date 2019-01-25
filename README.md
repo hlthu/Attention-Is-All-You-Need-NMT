@@ -24,7 +24,7 @@ If there is any suggestion or error, feel free to fire an issue to let me know. 
 
 # Requirement
 - python 3.4+
-- pytorch 0.2.0
+- pytorch 0.4.1+
 - tqdm
 - numpy
 
@@ -65,46 +65,36 @@ python preprocess.py -train_src data/multi30k/train.en.atok -train_tgt data/mult
 
 ### 2) Train the model
 ```bash
-python train.py -data data/multi30k.atok.low.pt -save_model trained -save_mode best -proj_share_weight 
+python train.py -data data/multi30k.atok.low.pt -save_model trained -save_mode best -proj_share_weight -label_smoothing
 ```
 > If your source and target language share one common vocabulary, use the `-embs_share_weight` flag to enable the model to share source/target word embedding. 
 
 ### 3) Test the model
 ```bash
-python translate.py -model trained.chkpt -vocab data/multi30k.atok.low.pt -src data/multi30k/test.en.atok
+python translate.py -model trained.chkpt -vocab data/multi30k.atok.low.pt -src data/multi30k/test.en.atok -no_cuda
 ```
 ---
 # Performance
 ## Training
 
 <p align="center">
-<img src="https://imgur.com/A6byNQ8.png" width="400">
-<img src="https://imgur.com/5z4f4tw.png" width="400">
+<img src="https://imgur.com/rKeP1bb.png" width="400">
+<img src="https://imgur.com/9je3X6U.png" width="400">
 </p>
 
 - Parameter settings:
-  - batch_size=64
-  - d_inner_hid=1024
-  - d_k=64
-  - d_v=64
-  - d_model=512
-  - d_word_vec=512
-  - dropout=0.1
-  - embs_share_weight=False
-  - n_head=8
-  - n_layers=6
-  - n_warmup_steps=4000
-  - proj_share_weight=True
+  - default parameter and optimizer settings
+  - label smoothing 
+  - target embedding / pre-softmax linear layer weight sharing. 
 
-- Elapse per epoch  (on NVIDIA Titan X):
-  - Training set: 1.38 min
-  - Validation set: 0.016 min
+- Elapse per epoch (on NVIDIA Titan X):
+  - Training set: 0.888 minutes
+  - Validation set: 0.011 minutes
   
 ## Testing 
 - coming soon.
 ---
 # TODO
-  - Label smoothing
   - Evaluation on the generated text.
   - Attention weight plot.
 ---
